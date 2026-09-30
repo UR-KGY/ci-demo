@@ -1,13 +1,13 @@
 package com.example.cidemo;
 
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.LinkedHashMap;
 import java.util.Map;
-
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 public class HelloController {
@@ -33,6 +33,6 @@ public class HelloController {
 
     @GetMapping("/health")
     public String health() {
-        return "OK";
+        return "not ok";
     }
 }
