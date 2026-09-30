@@ -1,4 +1,4 @@
-name: Deploy ci-demo to EC2 (SSM)
+name: Deploy ci-demo to EC2 (ECR)
 
 on:
   push:
@@ -12,6 +12,8 @@ permissions:
 
 env:
   AWS_REGION: ap-northeast-2
+  ECR_REPOSITORY: ci-demo
+  IMAGE_TAG: ${{ github.sha }}
 
 jobs:
   deploy:
@@ -22,7 +24,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ② Java 21 설치 + 빌드 (CI)
+      # ② Java 21 설치 + jar 빌드
       - name: Set up Java 21
         uses: actions/setup-java@v4
         with:
@@ -35,38 +37,62 @@ jobs:
           chmod +x gradlew
           ./gradlew clean bootJar
 
-      # ③ Access Key 없이 IAM Role을 빌려 AWS 로그인 (OIDC)
+      # ③ OIDC로 IAM Role 빌리기 (S3 방식과 동일)
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Check AWS identity
-        run: aws sts get-caller-identity
+      # ④ ECR 로그인 (registry 주소를 출력으로 받음)
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      # ④ jar를 S3에 업로드 (EC2가 여기서 받아 감)
-      - name: Upload jar to S3
-        run: |
-          aws s3 cp build/libs/ci-demo.jar \
-            s3://${{ secrets.DEPLOY_BUCKET }}/deploy/ci-demo.jar
+      # ⑤ ARM(t4g) EC2에서 실행할 수 있도록 linux/arm64 이미지 빌드 준비
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
-      # ⑤ SSM으로 EC2에 명령 전송 (22번 포트 사용 안 함)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ⑥ 이미지 빌드 + ECR에 push (태그: 커밋 번호)
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+
+      # ⑦ SSM으로 EC2에 "이미지 받아서 컨테이너 실행" 명령 전송
       - name: Deploy via SSM
         run: |
-          # EC2에서 실행할 스크립트 (SSM은 root로 실행하므로 앱은 ec2-user로 실행)
+          # EC2에서 실행할 스크립트 (SSM은 root로 실행)
           cat > remote.sh <<EOF
           set -e
-          aws s3 cp s3://${{ secrets.DEPLOY_BUCKET }}/deploy/ci-demo.jar /home/ec2-user/ci-demo.jar.new
-          chown ec2-user:ec2-user /home/ec2-user/ci-demo.jar.new
-          sudo -u ec2-user bash -lc '
-            cd ~
-            if [ -f ci-demo.pid ]; then kill "\$(cat ci-demo.pid)" 2>/dev/null || true; sleep 3; fi
-            mv ci-demo.jar.new ci-demo.jar
-            nohup java -Xmx256m -jar ci-demo.jar --app.version=${{ github.sha }} > ci-demo.log 2>&1 < /dev/null &
-            echo \$! > ci-demo.pid
-            echo "started PID \$(cat ci-demo.pid)"
-          '
+          REGISTRY=${{ steps.ecr.outputs.registry }}
+          IMAGE=\$REGISTRY/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+
+          # ECR 로그인 후 이미지 받기
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin \$REGISTRY
+          docker pull \$IMAGE
+
+          # 이전 S3 방식으로 실행 중인 jar가 있으면 종료 (8081 포트 비우기)
+          if [ -f /home/ec2-user/ci-demo.pid ]; then
+            kill "\$(cat /home/ec2-user/ci-demo.pid)" 2>/dev/null || true
+            rm -f /home/ec2-user/ci-demo.pid
+            sleep 3
+          fi
+
+          # 이전 컨테이너 교체
+          docker rm -f ci-demo 2>/dev/null || true
+          docker run -d --name ci-demo --restart unless-stopped -p 8081:8081 \$IMAGE --app.version=${{ env.IMAGE_TAG }}
+
+          # 사용하지 않는 이전 이미지 정리 (디스크 절약)
+          docker image prune -af --filter "until=24h" || true
+
+          docker ps --filter name=ci-demo --format "running: {{.Image}} ({{.Status}})"
           EOF
 
           PARAMS=$(jq -n --rawfile s remote.sh '{commands: [$s]}')
@@ -74,7 +100,7 @@ jobs:
           CMD_ID=$(aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
-            --comment "ci-demo ${{ github.sha }}" \
+            --comment "ci-demo ecr ${{ env.IMAGE_TAG }}" \
             --parameters "$PARAMS" \
             --query "Command.CommandId" --output text)
           echo "SSM Command ID: $CMD_ID"
@@ -96,7 +122,7 @@ jobs:
             --query "Status" --output text)
           [ "$STATUS" = "Success" ] || { echo "SSM 명령 실패: $STATUS"; exit 1; }
 
-      # ⑥ 서버 응답 확인 (최대 2분)
+      # ⑧ 서버 응답 확인 (최대 2분)
       - name: Health check
         run: |
           for i in $(seq 1 12); do
@@ -107,5 +133,5 @@ jobs:
             fi
             echo "대기 중... ($i/12)"; sleep 10
           done
-          echo "응답 없음: EC2에서 ~/ci-demo.log 확인"
+          echo "응답 없음: EC2에서 docker logs ci-demo 확인"
           exit 1
