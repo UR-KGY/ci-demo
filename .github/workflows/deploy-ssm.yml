@@ -1,0 +1,111 @@
+name: Deploy ci-demo to EC2 (SSM)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# GitHub OIDC 토큰을 발급받아 AWS IAM Role을 빌려 쓰기 위한 권한
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ① 코드 받기
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ② Java 21 설치 + 빌드 (CI)
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: corretto
+          java-version: '21'
+          cache: gradle
+
+      - name: Build jar
+        run: |
+          chmod +x gradlew
+          ./gradlew clean bootJar
+
+      # ③ Access Key 없이 IAM Role을 빌려 AWS 로그인 (OIDC)
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check AWS identity
+        run: aws sts get-caller-identity
+
+      # ④ jar를 S3에 업로드 (EC2가 여기서 받아 감)
+      - name: Upload jar to S3
+        run: |
+          aws s3 cp build/libs/ci-demo.jar \
+            s3://${{ secrets.DEPLOY_BUCKET }}/deploy/ci-demo.jar
+
+      # ⑤ SSM으로 EC2에 명령 전송 (22번 포트 사용 안 함)
+      - name: Deploy via SSM
+        run: |
+          # EC2에서 실행할 스크립트 (SSM은 root로 실행하므로 앱은 ec2-user로 실행)
+          cat > remote.sh <<EOF
+          set -e
+          aws s3 cp s3://${{ secrets.DEPLOY_BUCKET }}/deploy/ci-demo.jar /home/ec2-user/ci-demo.jar.new
+          chown ec2-user:ec2-user /home/ec2-user/ci-demo.jar.new
+          sudo -u ec2-user bash -lc '
+            cd ~
+            if [ -f ci-demo.pid ]; then kill "\$(cat ci-demo.pid)" 2>/dev/null || true; sleep 3; fi
+            mv ci-demo.jar.new ci-demo.jar
+            nohup java -Xmx256m -jar ci-demo.jar --app.version=${{ github.sha }} > ci-demo.log 2>&1 < /dev/null &
+            echo \$! > ci-demo.pid
+            echo "started PID \$(cat ci-demo.pid)"
+          '
+          EOF
+
+          PARAMS=$(jq -n --rawfile s remote.sh '{commands: [$s]}')
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "ci-demo ${{ github.sha }}" \
+            --parameters "$PARAMS" \
+            --query "Command.CommandId" --output text)
+          echo "SSM Command ID: $CMD_ID"
+
+          sleep 3
+          aws ssm wait command-executed \
+            --command-id "$CMD_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" || true
+
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
+            --output yaml
+
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$CMD_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --query "Status" --output text)
+          [ "$STATUS" = "Success" ] || { echo "SSM 명령 실패: $STATUS"; exit 1; }
+
+      # ⑥ 서버 응답 확인 (최대 2분)
+      - name: Health check
+        run: |
+          for i in $(seq 1 12); do
+            if curl -sf http://${{ secrets.EC2_HOST }}:8081/health; then
+              echo ""; echo "배포 성공"
+              curl -s http://${{ secrets.EC2_HOST }}:8081/
+              exit 0
+            fi
+            echo "대기 중... ($i/12)"; sleep 10
+          done
+          echo "응답 없음: EC2에서 ~/ci-demo.log 확인"
+          exit 1
