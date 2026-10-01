@@ -122,16 +122,17 @@ jobs:
             --query "Status" --output text)
           [ "$STATUS" = "Success" ] || { echo "SSM 명령 실패: $STATUS"; exit 1; }
 
-      # ⑧ 서버 응답 확인 (최대 2분)
-      - name: Health check
+      # ⑧ 서버 응답 확인 (최대 2분) — ALB(80) 경유
+      #    EC2 8081은 ALB 보안 그룹에서만 열려 있으므로 Runner는 ALB DNS로 확인
+      - name: Health check (via ALB)
         run: |
           for i in $(seq 1 12); do
-            if curl -sf http://${{ secrets.EC2_HOST }}:8081/health; then
+            if curl -sf http://${{ secrets.ALB_DNS }}/health; then
               echo ""; echo "배포 성공"
-              curl -s http://${{ secrets.EC2_HOST }}:8081/
+              curl -s http://${{ secrets.ALB_DNS }}/
               exit 0
             fi
             echo "대기 중... ($i/12)"; sleep 10
           done
-          echo "응답 없음: EC2에서 docker logs ci-demo 확인"
+          echo "응답 없음: 대상 그룹 상태 / EC2에서 docker logs ci-demo 확인"
           exit 1
