@@ -63,7 +63,10 @@ jobs:
           context: .
           platforms: linux/arm64
           push: true
-          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          # SHA 태그(롤백용) + latest 태그(ASG가 새 서버를 만들 때 받을 이미지)
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
 
       # ⑦ SSM으로 EC2에 "이미지 받아서 컨테이너 실행" 명령 전송
       - name: Deploy via SSM
