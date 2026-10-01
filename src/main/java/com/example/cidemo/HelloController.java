@@ -20,7 +20,7 @@ public class HelloController {
     private String version;
 
     // 이 문구를 바꿔서 push하면 자동 배포가 되는지 확인할 수 있음
-    private static final String MESSAGE = "Hello CI/CD!";
+    private static final String MESSAGE = "Hello ASG!";
 
     @GetMapping("/")
     public Map<String, String> hello() {
@@ -33,6 +33,6 @@ public class HelloController {
 
     @GetMapping("/health")
     public String health() {
-        return "not ok";
+        return "ok";
     }
 }
